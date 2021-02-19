@@ -7,46 +7,51 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 
 
-class DeformConv2D(nn.Module):
+class DeformConv2d(nn.Module):
+    """
+    此为可变卷积核，作为可变神经网络的核与池化基础
+    """
+
     def __init__(self, inc, out_c, kernel_size=3, padding=1, bias=None):
         """
-        :param inc: input channel
-        :param out_c: output channel
-        :param kernel_size:  这不用说吧
-        :param padding:  是否填充 Y=1, N=0
-        :param bias: 偏置
+        :param inc:  input channel \n
+        :param out_c:  output channel \n
+        :param kernel_size: 核大小 \n
+        :param padding: 是否进行零填充 \n
+        :param bias: 是否偏置 \n
         """
-        super(DeformConv2D, self).__init__()
-
+        super(DeformConv2d, self).__init__()  # 继承
         self.kernel_size = kernel_size
-        self.conv_kernel = nn.Conv2d(inc, out_c, kernel_size=kernel_size, stride=kernel_size, bias=bias)
         self.padding = padding
-        self.zero_padding = nn.ZeroPad2d(padding)
+        self.zero_padding = nn.ZeroPad2d(padding)  # 零填充
+        self.conv_kernel = nn.Conv2d(inc, out_c, kernel_size=kernel_size, stride=kernel_size, bias=bias)
 
     def forward(self, x, offset):
-        data_type = offset.data.type()  # 得到例如torch.FloatTensor的数据类型
-        ks = self.kernel_size
-        n = offset.size(1) // 2  # 得到a*b的b,再将b//2赋值给N
+        data_type = offset.data.type()
+        kernel_size = self.kernel_size
+        n = offset.size(1) // 2
 
-        # 得到偶数range和奇数的，再将他们连接起来，再转换为Variable类型
-        offset_index = Variable(torch.cat([torch.arange(0, 2 * n, 2), torch.arange(1, 2 * n + 1, 2)]),
+        offset_index = Variable(torch.cat([torch.arange(0, 2 * n, 2),
+                                           torch.arange(1, 2 * n + 1, 2)]),
                                 requires_grad=False).type_as(x).long()
-        offset_index = offset_index.unsqueeze(dim=0)  # 增加一个维度，例如原本为[1,2,3]现在变成了[[1,2,3]]
-        offset_index = offset_index.unsqueeze(dim=-1)  # 先增加一个维度，然后将其转换为列向量,变成了如[[[1],[2],[3]]]
-        offset_index = offset_index.unsqueeze(dim=-1)
-        offset_index = offset_index.unsqueeze(dim=-1)  # 变成了[[ [[[[1]]]],[[[[2]]]],[[[[3]]]]]]
-        offset_index = offset_index.expand(*offset.size())  # 扩展
-        offset = torch.gather(offset, dim=1, index=offset_index)  # 沿给定轴dim，将输入索引张量index指定位置的值进行聚合
-
-        if self.padding:  # 如果需要进行0填充，则对x进行填充
+        # 增加和变换维度
+        offset_index = offset_index.unsqueeze(dim=0).unsqueeze(dim=-1).unsqueeze(dim=-1).expand(*offset.size())
+        # 偏移量，即delta p
+        offset = torch.gather(offset, dim=1, index=offset_index)
+        # 检查是否需要进行零填充
+        if self.padding:
             x = self.zero_padding(x)
 
-        # 下面所进行的操作，均为双线性插值的算法，即计算出偏移量delta P
         p = self.get_p(offset, data_type)
-        p = p.contiguous().permute(0, 2, 3, 1)  # 将tensor的维度换位, 类似zip，将其逐一对应形成新的维度
+        # 得到p，其结构为(b, 2n, h, w)
+        p = p.contiguous().permute(0, 2, 3, 1)
+        # 转换p，使其变为(b, h, w, 2n)
+
+        # 下面使用双线性插值法进行学习，得到最后的偏移量
         q_lt = Variable(p.data, requires_grad=False).floor()
         q_rb = q_lt + 1
 
+        # 三点表示多维度切片
         q_lt = torch.cat([torch.clamp(q_lt[..., :n], 0, x.size(2) - 1), torch.clamp(q_lt[..., n:], 0, x.size(3) - 1)],
                          dim=-1).long()
         q_rb = torch.cat([torch.clamp(q_rb[..., :n], 0, x.size(2) - 1), torch.clamp(q_rb[..., n:], 0, x.size(3) - 1)],
@@ -54,67 +59,62 @@ class DeformConv2D(nn.Module):
         q_lb = torch.cat([q_lt[..., :n], q_rb[..., n:]], -1)
         q_rt = torch.cat([q_rb[..., :n], q_lt[..., n:]], -1)
 
-        # (b, h, w, N)
         mask = torch.cat([p[..., :n].lt(self.padding) + p[..., :n].gt(x.size(2) - 1 - self.padding),
                           p[..., n:].lt(self.padding) + p[..., n:].gt(x.size(3) - 1 - self.padding)], dim=-1).type_as(p)
+        # 得到(b, h, w, n)的结构
         mask = mask.detach()
         floor_p = p - (p - torch.floor(p))
         p = p * (1 - mask) + floor_p * mask
         p = torch.cat([torch.clamp(p[..., :n], 0, x.size(2) - 1), torch.clamp(p[..., n:], 0, x.size(3) - 1)], dim=-1)
 
-        # bilinear kernel (b, h, w, N)
+        # 线性插值(b, h, w, n)
         g_lt = (1 + (q_lt[..., :n].type_as(p) - p[..., :n])) * (1 + (q_lt[..., n:].type_as(p) - p[..., n:]))
         g_rb = (1 - (q_rb[..., :n].type_as(p) - p[..., :n])) * (1 - (q_rb[..., n:].type_as(p) - p[..., n:]))
         g_lb = (1 + (q_lb[..., :n].type_as(p) - p[..., :n])) * (1 - (q_lb[..., n:].type_as(p) - p[..., n:]))
         g_rt = (1 - (q_rt[..., :n].type_as(p) - p[..., :n])) * (1 + (q_rt[..., n:].type_as(p) - p[..., n:]))
 
-        # (b, c, h, w, N)
+        # 得到(b, c, h, w, n)
         x_q_lt = self.get_xq(x, q_lt, n)
         x_q_rb = self.get_xq(x, q_rb, n)
         x_q_lb = self.get_xq(x, q_lb, n)
         x_q_rt = self.get_xq(x, q_rt, n)
 
-        # (b, c, h, w, N)
-        x_offset = g_lt.unsqueeze(dim=1) * x_q_lt + g_rb.unsqueeze(dim=1) * x_q_rb + \
-                   g_lb.unsqueeze(dim=1) * x_q_lb + \
-                   g_rt.unsqueeze(dim=1) * x_q_rt
+        # 形成输出数据的结构(b, c, h, w, n)
+        x_offset = (g_lt.unsqueeze(dim=1) * x_q_lt) + \
+                   (g_rb.unsqueeze(dim=1) * x_q_rb) + \
+                   (g_lb.unsqueeze(dim=1) * x_q_lb) + \
+                   (g_rt.unsqueeze(dim=1) * x_q_rt)
 
-        x_offset = self.reshape_offset_x(x_offset, ks)
-        out = self.conv_kernel(x_offset)
+        x_offset = self.reshape_the_offset(x_offset, kernel_size)
+        out_x = self.conv_kernel(x_offset)
 
-        return out
+        return out_x
+
+    def get_pn(self, n, data_type):
+        p_n_x, p_n_y = np.meshgrid(range(-(self.kernel_size - 1) // 2, (self.kernel_size - 1) // 2 + 1),
+                                   range(-(self.kernel_size - 1) // 2, (self.kernel_size - 1) // 2 + 1),
+                                   indexing='ij')
+        p_n = np.concatenate((p_n_x.flatten(), p_n_y.flatten()))  # (2n, 1)
+        p_n = np.reshape(p_n, (1, 2 * n, 1, 1))
+        p_n = Variable(torch.from_numpy(p_n).type(data_type), requires_grad=False)
+
+        return p_n
 
     @staticmethod
     def get_p0(h, w, n, data_type):
         p0_x, p0_y = np.meshgrid(range(1, h + 1), range(1, w + 1), indexing='ij')
         p0_x = p0_x.flatten().reshape(1, 1, h, w).repeat(n, axis=1)
         p0_y = p0_y.flatten().reshape(1, 1, h, w).repeat(n, axis=1)
-        p0 = np.concatenate((p0_x, p0_y), axis=1)
-        p0 = Variable(torch.from_numpy(p0).type(data_type), requires_grad=False)
+        p_0 = np.concatenate((p0_x, p0_y), axis=1)
+        p_0 = Variable(torch.from_numpy(p_0).type(data_type), requires_grad=False)
 
-        return p0
-
-    def get_pn(self, n, data_type):
-        pn_x, pn_y = np.meshgrid(range(-(self.kernel_size - 1) // 2, (self.kernel_size - 1) // 2 + 1),
-                                 range(-(self.kernel_size - 1) // 2, (self.kernel_size - 1 // 2 + 1)),
-                                 indexing='ij')
-        pn_x = pn_x.flatten()
-        pn_y = pn_y.flatten()
-        pn = np.concatenate((pn_x, pn_y))
-        pn = np.reshape(pn, (1, 2 * n, 1, 1))
-        pn = Variable(torch.from_numpy(pn).type(data_type), requires_grad=False)
-
-        return pn
+        return p_0
 
     def get_p(self, offset, data_type):
-        n = offset.size(1) // 2
-        h = offset.size(2)
-        w = offset.size(3)
-
-        pn = self.get_pn(n, data_type)
-        p0 = self.get_p0(h, w, n, data_type)
-        p = p0 + pn + offset
-
+        n, h, w = offset.size(1) // 2, offset.size(2), offset.size(3)
+        p_n = self.get_pn(n, data_type)  # (1, 2n, 1, 1)
+        p_0 = self.get_p0(h, w, n, data_type)  # (1, 2n, h, w)
+        p = p_0 + p_n + offset
         return p
 
     @staticmethod
@@ -122,25 +122,26 @@ class DeformConv2D(nn.Module):
         b, h, w, _ = q.size()
         padded_w = x.size(3)
         c = x.size(1)
-        # 有些tensor并不是占用一整块内存，而是由不同的数据块组成
-        # 而tensor的view()操作依赖于内存是整块的
-        # 这时只需要执行contiguous()这个函数,把tensor变成在内存中连续分布的形式。
-        x = x.contiguous().view(b, c, -1)
-        index = q[..., :n] * padded_w + q[..., n:]  # 多维切片
+        x = x.contiguous().view(b, c, -1)  # (b, c, h*w)
+
+        # (b, h, w, n)
+        index = q[..., :n] * padded_w + q[..., n:]  # offset_x*w + offset_y
+        # (b, c, h*w*n)
         index = index.contiguous().unsqueeze(dim=1).expand(-1, c, -1, -1, -1).contiguous().view(b, c, -1)
 
-        offset_x = x.gather(dim=-1, index=index).contiguous().view(b, c, h, w, n)
+        x_offset = x.gather(dim=-1, index=index).contiguous().view(b, c, h, w, n)
 
-        return offset_x
+        return x_offset
 
     @staticmethod
-    def reshape_offset_x(offset_x, kernel_size):
-        b, c, h, w, n = offset_x.size()
-        offset_x = torch.cat([offset_x[..., s:s + kernel_size].contiguous().view(b, c, h, w * kernel_size)
-                              for s in range(0, n, kernel_size)], dim=-1)
-        offset_x = offset_x.contiguous().view(b, c, h * kernel_size, w * kernel_size)
+    def reshape_the_offset(x_offset, kernel_size):
+        b, c, h, w, n = x_offset.size()
+        x_offset = torch.cat([x_offset[..., s:s + kernel_size].contiguous().view(b, c, h, w * kernel_size) for s in
+                              range(0, n, kernel_size)],
+                             dim=-1)
+        x_offset = x_offset.contiguous().view(b, c, h * kernel_size, w * kernel_size)
 
-        return offset_x
+        return x_offset
 
 
 class DCN(nn.Module):
@@ -152,7 +153,8 @@ class DCN(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.offsets = nn.Conv2d(128, 18, kernel_size=3, padding=1)
+        self.conv4 = DeformConv2d(128, 128, kernel_size=3, padding=1)
         self.bn4 = nn.BatchNorm2d(128)
         self.classifier = nn.Linear(128, 10)
 
@@ -163,27 +165,26 @@ class DCN(nn.Module):
         x = self.bn2(x)
         x = F.relu(self.conv3(x))
         x = self.bn3(x)
-        x = F.relu(self.conv4(x))
+        offsets = self.offsets(x)
+        x = F.relu(self.conv4(x, offsets))
         x = self.bn4(x)
+
         x = F.avg_pool2d(x, kernel_size=28, stride=1).view(x.size(0), -1)
         x = self.classifier(x)
 
         return F.log_softmax(x, dim=1)
 
 
-net = DCN()
-
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-
+# 此为训练集
 train_loader = torch.utils.data.DataLoader(
+    # 第一个为数据集的路径，如果download为True，则表示需要从网络下载mnist数据集
     datasets.MNIST('./data', train=True, download=True,
                    transform=transforms.Compose([
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,))
                    ])),
     batch_size=6, shuffle=True)
-
+# 此为测试集
 test_loader = torch.utils.data.DataLoader(
     datasets.MNIST('./data', train=False, transform=transforms.Compose([
         transforms.ToTensor(),
@@ -191,17 +192,29 @@ test_loader = torch.utils.data.DataLoader(
     ])),
     batch_size=6, shuffle=True)
 
+# 检查当前设备是GPU还是CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Assuming that we are on a CUDA machine, this should print a CUDA device:
 
-print(device)
-DEVICE = device
-EPOCHS = 2
-model = DCN().to(DEVICE)
-optimizer = optim.Adam(model.parameters())
+def print_device(x):  # 200-207行为现实当前设备类型
+    if x == 'cpu':
+        return 'CPU'
+    else:
+        return 'GPU'
 
 
+print('你当前的设备类型是: {}'.format(print_device(device)))  # 测试时可以打印出来看一看
+
+DEVICE = device  # 设备类型
+EPOCHS = 3  # 训练轮次
+model = DCN().to(DEVICE)  # 模型载入设备中，如果是GPU则载入GPU
+# 随机梯度下降的方法
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+
+
+# optimizer = optim.Adam(model.parameters())
+
+# 训练数据区
 def train(model, device, train_loader, optimizer, epoch):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
@@ -214,10 +227,11 @@ def train(model, device, train_loader, optimizer, epoch):
         if (batch_idx + 1) % 30 == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                       100. * batch_idx / len(train_loader), loss.item()))
+                100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(model, device, test_loader):
+# 测试数据区
+def test(model, device, test_loader, epoch):
     model.eval()
     test_loss = 0
     correct = 0
@@ -230,11 +244,11 @@ def test(model, device, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
+    print('\nTest set (epoch{}): Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        epoch, test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
 
 for epoch in range(1, EPOCHS + 1):
     train(model, DEVICE, train_loader, optimizer, epoch)
-    test(model, DEVICE, test_loader)
+    test(model, DEVICE, test_loader, epoch)
